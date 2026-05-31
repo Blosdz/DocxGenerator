@@ -1,0 +1,2 @@
+class RepositoryNotFoundError(LookupError):
+    pass
