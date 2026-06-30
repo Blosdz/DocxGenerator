@@ -9,7 +9,7 @@ alias deactivate 'test $?_OLD_VIRTUAL_PATH != 0 && setenv PATH "$_OLD_VIRTUAL_PA
 # Unset irrelevant variables.
 deactivate nondestructive
 
-setenv VIRTUAL_ENV /media/iuvade/f82c635f-24d6-435b-961b-652be2b66b771/TRABAJO/AEIA/thesis/fullProyect/thesis-doc-generator/venv
+setenv VIRTUAL_ENV /media/velorie/f82c635f-24d6-435b-961b-652be2b66b77/TRABAJO/AEIA/thesis/fullProyect/thesis-doc-generator/venv
 
 set _OLD_VIRTUAL_PATH="$PATH"
 setenv PATH "$VIRTUAL_ENV/"bin":$PATH"

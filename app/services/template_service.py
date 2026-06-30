@@ -17,11 +17,12 @@ class TemplateService:
             CitationStyle.APA7: "apa7.docx",
             CitationStyle.IEEE: "ieee.docx",
             CitationStyle.VANCOUVER: "vancouver.docx",
+            CitationStyle.ISO690: "iso690.docx",
+            CitationStyle.MLA: "mla.docx",
         }[style]
         path = self.templates_dir / filename
 
-        if style == CitationStyle.APA7:
-            self._ensure_valid_docx(path)
+        self._ensure_valid_docx(path)
 
         return path
 

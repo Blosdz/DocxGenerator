@@ -34,10 +34,17 @@ class ThesisRead(BaseModel):
         return self.data
 
 
+class SubsectionBase(BaseModel):
+    title: str = Field(min_length=1)
+    content: str = ""
+
+
 class SectionBase(BaseModel):
     title: str = Field(min_length=1)
+    parent_id: UUID | None = None
     subtitle: str | None = None
-    level: int = Field(ge=1, le=3)
+    subsections: list[SubsectionBase] = Field(default_factory=list)
+    level: int = Field(ge=1, le=6)
     content: str = ""
     order: int = Field(ge=0)
 
@@ -48,10 +55,16 @@ class SectionCreate(SectionBase):
 
 class SectionUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1)
+    parent_id: UUID | None = Field(default=None)
     subtitle: str | None = None
-    level: int | None = Field(default=None, ge=1, le=3)
+    subsections: list[SubsectionBase] | None = None
+    level: int | None = Field(default=None, ge=1, le=6)
     content: str | None = None
     order: int | None = Field(default=None, ge=0)
+
+
+class AppendSectionTextRequest(BaseModel):
+    text: str = Field(min_length=1)
 
 
 class SectionRead(SectionBase):
@@ -61,3 +74,14 @@ class SectionRead(SectionBase):
     created_at: datetime
     updated_at: datetime
     deleted_at: datetime | None = None
+
+
+class SkeletonSectionItem(BaseModel):
+    title: str = Field(min_length=1)
+    level: int = Field(ge=1, le=6)
+    order: int = Field(ge=0)
+    required: bool = True
+
+
+class FromSkeletonRequest(BaseModel):
+    sections: list[SkeletonSectionItem] = Field(min_length=1)

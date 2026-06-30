@@ -6,6 +6,7 @@ import httpx
 
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+DOCM_MIME = "application/vnd.ms-word.document.macroEnabled.12"
 
 
 class BackendUploadError(RuntimeError):
@@ -22,6 +23,7 @@ class BackendUploadService:
         filename: str,
         backend_url: str,
         authorization: str,
+        mime_type: str | None = None,
     ) -> dict[str, Any]:
         if not backend_url:
             raise BackendUploadError("Backend URL is not configured")
@@ -35,7 +37,7 @@ class BackendUploadService:
                     url,
                     headers={"Authorization": authorization},
                     data={"modo": "tesis"},
-                    files={"file": (filename, file_obj, DOCX_MIME)},
+                    files={"file": (filename, file_obj, mime_type or self._word_mime_type(filename))},
                     timeout=90,
                 )
         except httpx.HTTPError as exc:
@@ -61,3 +63,8 @@ class BackendUploadService:
             return response.json()
         except ValueError:
             return response.text
+
+    def _word_mime_type(self, filename: str) -> str:
+        if filename.lower().endswith(".docm"):
+            return DOCM_MIME
+        return DOCX_MIME

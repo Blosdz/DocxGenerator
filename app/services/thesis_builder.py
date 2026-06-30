@@ -34,16 +34,17 @@ class ThesisBuilder:
         thesis = self.thesis_repository.get(tesis_id)
         sections = self.thesis_repository.list_sections(tesis_id)
         references = self.references_repository.list_by_thesis(tesis_id)
-        style = CitationStyle(thesis.thesis_metadata.get("style", CitationStyle.APA7.value))
+        style = self._resolve_citation_style(thesis.thesis_metadata)
         response = self.docx_service.generate(thesis, sections, references, style)
 
         if upload_to_backend:
             upload = self.backend_upload_service.upload_thesis_document(
                 tesis_id=tesis_id,
                 path=response.path,
-                filename=self.docx_service.upload_filename(thesis),
+                filename=response.filename,
                 backend_url=backend_url or "",
                 authorization=authorization or "",
+                mime_type=response.mime_type,
             )
             return response.model_copy(update={"uploaded": True, "upload": upload})
 
@@ -53,3 +54,23 @@ class ThesisBuilder:
             response.filename,
         )
         return response.model_copy(update={"document_id": document_id})
+
+    def _resolve_citation_style(self, metadata: dict) -> CitationStyle:
+        raw_style = (
+            metadata.get("doc_thesis_format")
+            or metadata.get("citation_style")
+            or metadata.get("style")
+            or CitationStyle.APA7.value
+        )
+        normalized = str(raw_style).strip().replace("-", "").replace("_", "").upper()
+        aliases = {
+            "APA7": CitationStyle.APA7,
+            "APA": CitationStyle.APA7,
+            "VANCOUVER": CitationStyle.VANCOUVER,
+            "IEEE": CitationStyle.IEEE,
+            "ISO690": CitationStyle.ISO690,
+            "ISO": CitationStyle.ISO690,
+            "MLA": CitationStyle.MLA,
+            "THESIS": CitationStyle.APA7,
+        }
+        return aliases.get(normalized, CitationStyle.APA7)

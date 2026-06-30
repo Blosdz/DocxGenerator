@@ -10,6 +10,8 @@ class CitationStyle(StrEnum):
     APA7 = "APA7"
     IEEE = "IEEE"
     VANCOUVER = "VANCOUVER"
+    ISO690 = "ISO690"
+    MLA = "MLA"
 
 
 class ReferenceType(StrEnum):
@@ -32,6 +34,9 @@ class ReferenceBase(BaseModel):
     type: ReferenceType
     publisher: str | None = None
     journal: str | None = None
+    volume: str | None = None
+    issue: str | None = None
+    pages: str | None = None
     doi: str | None = None
     url: str | None = None
     accessed_at: date | None = None
@@ -48,11 +53,21 @@ class ReferenceBase(BaseModel):
             normalized["publisher"] = normalized["editorial"]
         if "journal" not in normalized and "revista" in normalized:
             normalized["journal"] = normalized["revista"]
+        if "volume" not in normalized and "volumen" in normalized:
+            normalized["volume"] = normalized["volumen"]
+        if "issue" not in normalized and "numero" in normalized:
+            normalized["issue"] = normalized["numero"]
+        if "pages" not in normalized and "paginas" in normalized:
+            normalized["pages"] = normalized["paginas"]
         if "accessed_at" not in normalized:
             if "access_date" in normalized:
                 normalized["accessed_at"] = normalized["access_date"]
             elif "fecha_consulta" in normalized:
                 normalized["accessed_at"] = normalized["fecha_consulta"]
+        if "style" in normalized and normalized["style"] is not None:
+            raw = str(normalized["style"]).strip().replace("-", "").replace("_", "").upper()
+            _style_map = {"APA7": "APA7", "APA": "APA7", "VANCOUVER": "VANCOUVER", "IEEE": "IEEE", "ISO690": "ISO690", "ISO": "ISO690", "MLA": "MLA"}
+            normalized["style"] = _style_map.get(raw, normalized["style"])
         return normalized
 
 
@@ -67,6 +82,9 @@ class ReferenceUpdate(BaseModel):
     type: ReferenceType | None = None
     publisher: str | None = None
     journal: str | None = None
+    volume: str | None = None
+    issue: str | None = None
+    pages: str | None = None
     doi: str | None = None
     url: str | None = None
     accessed_at: date | None = None

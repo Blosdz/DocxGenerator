@@ -33,7 +33,7 @@ end
 # Unset irrelevant variables.
 deactivate nondestructive
 
-set -gx VIRTUAL_ENV /media/iuvade/f82c635f-24d6-435b-961b-652be2b66b771/TRABAJO/AEIA/thesis/fullProyect/thesis-doc-generator/venv
+set -gx VIRTUAL_ENV /media/velorie/f82c635f-24d6-435b-961b-652be2b66b77/TRABAJO/AEIA/thesis/fullProyect/thesis-doc-generator/venv
 
 set -gx _OLD_VIRTUAL_PATH $PATH
 set -gx PATH "$VIRTUAL_ENV/"bin $PATH

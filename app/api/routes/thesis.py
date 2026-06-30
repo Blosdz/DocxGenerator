@@ -2,7 +2,15 @@ from uuid import UUID
 
 from fastapi import APIRouter, status
 
-from app.models.thesis import SectionCreate, SectionRead, SectionUpdate, ThesisCreate, ThesisRead
+from app.models.thesis import (
+    AppendSectionTextRequest,
+    FromSkeletonRequest,
+    SectionCreate,
+    SectionRead,
+    SectionUpdate,
+    ThesisCreate,
+    ThesisRead,
+)
 from app.repositories.thesis_repository import ThesisRepository
 
 
@@ -38,6 +46,11 @@ async def replace_sections(tesis_id: UUID, payload: list[SectionCreate]) -> list
     return get_repository().replace_sections(tesis_id, payload)
 
 
+@router.post("/{tesis_id}/sections/from-skeleton", response_model=list[SectionRead], status_code=status.HTTP_201_CREATED)
+async def apply_skeleton_sections(tesis_id: UUID, payload: FromSkeletonRequest) -> list[SectionRead]:
+    return get_repository().replace_sections_from_skeleton(tesis_id, payload.sections)
+
+
 @router.patch("/{tesis_id}/sections/{section_id}", response_model=SectionRead)
 async def update_section(
     tesis_id: UUID,
@@ -45,6 +58,15 @@ async def update_section(
     payload: SectionUpdate,
 ) -> SectionRead:
     return get_repository().update_section(tesis_id, section_id, payload)
+
+
+@router.post("/{tesis_id}/sections/{section_id}/append-text", response_model=SectionRead)
+async def append_section_text(
+    tesis_id: UUID,
+    section_id: UUID,
+    payload: AppendSectionTextRequest,
+) -> SectionRead:
+    return get_repository().append_section_text(tesis_id, section_id, payload.text)
 
 
 @router.delete("/{tesis_id}/sections/{section_id}")
