@@ -34,8 +34,11 @@ class ThesisBuilder:
         thesis = self.thesis_repository.get(tesis_id)
         sections = self.thesis_repository.list_sections(tesis_id)
         references = self.references_repository.list_by_thesis(tesis_id)
+        colmena_charts = self.thesis_repository.list_colmena_charts(tesis_id)
         style = self._resolve_citation_style(thesis.thesis_metadata)
-        response = self.docx_service.generate(thesis, sections, references, style)
+        response = self.docx_service.generate(
+            thesis, sections, references, style, colmena_charts=colmena_charts
+        )
 
         if upload_to_backend:
             upload = self.backend_upload_service.upload_thesis_document(

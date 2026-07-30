@@ -123,6 +123,18 @@ class ThesisRepository:
 
         return [self._section_from_row(row) for row in rows]
 
+    def list_colmena_charts(self, tesis_id: UUID) -> list[dict]:
+        """Gráficas de Colmena importadas a la tesis (tabla colmena_graficos_tesis)."""
+        query = f"""
+            SELECT id, colmena_form_id, colmena_artifact_id, titulo, mime_type, data_base64
+            FROM "{self.schema}".colmena_graficos_tesis
+            WHERE tesis_id = %s
+            ORDER BY creado_en
+        """
+        with get_connection() as connection:
+            rows = connection.execute(query, (tesis_id,)).fetchall()
+        return [dict(row) for row in rows]
+
     def replace_sections(self, tesis_id: UUID, sections: list[SectionCreate]) -> list[SectionRead]:
         self.get(tesis_id)
         with get_connection() as connection:

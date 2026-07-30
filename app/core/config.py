@@ -57,6 +57,7 @@ class Settings(BaseModel):
     database_url: str | None = Field(default=None)
     db_schema: str = Field(default="AT")
     backend_url: str = Field(default="http://127.0.0.1:3000")
+    colmena_api_base_url: str = Field(default="http://127.0.0.1:8080")
     templates_dir: Path = Field(default=PROJECT_ROOT / "app" / "templates")
     generated_dir: Path = Field(default=PROJECT_ROOT / "app" / "generated")
     vba_project_path: Path = Field(default=PROJECT_ROOT / "app" / "templates" / "vbaProject.bin")
@@ -76,6 +77,7 @@ def get_settings() -> Settings:
         database_url=_database_url(),
         db_schema=_env("DB_SCHEMA", "AT"),
         backend_url=_env("BACKEND_URL", "http://127.0.0.1:3000"),
+        colmena_api_base_url=_env("COLMENA_API_BASE_URL", "http://127.0.0.1:8080"),
         vba_project_path=Path(
             _env(
                 "DOCX_VBA_PROJECT_PATH",

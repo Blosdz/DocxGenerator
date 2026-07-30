@@ -1,6 +1,8 @@
 from datetime import UTC, datetime
 from io import BytesIO
 from copy import deepcopy
+import base64
+import json
 import logging
 import os
 from pathlib import Path
@@ -56,6 +58,13 @@ DOCUMENT_RELS = "word/_rels/document.xml.rels"
 CONTENT_TYPES = "[Content_Types].xml"
 FIELD_LOCALE = "10250"
 CITATION_TOKEN_PATTERN = re.compile(r"(\{\{cite:([A-Za-z0-9_-]+)\}\}|\[cite:([A-Za-z0-9_-]+)\])")
+# Marcador de gráfica de Colmena incrustado en el contenido de una sección.
+# Formato: [[colmena-figura form=<form_id> artifact=<artifact_id> caption="Título"]]
+COLMENA_FIGURE_PATTERN = re.compile(
+    r'\[\[colmena-figura\s+form=(?P<form>[A-Za-z0-9_-]+)\s+artifact=(?P<artifact>[A-Za-z0-9_-]+)'
+    r'(?:\s+caption="(?P<caption>[^"]*)")?\s*\]\]'
+)
+COLMENA_AMBER = RGBColor(0xF5, 0xB2, 0x1A)
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +84,10 @@ class DocxService:
         self.vba_project_path = settings.vba_project_path
         self.enable_docm_macro = settings.enable_docm_macro
         self.backend_url = settings.backend_url.rstrip("/")
+        self.colmena_api_base_url = settings.colmena_api_base_url.rstrip("/")
+        self._figure_counter = 0
+        self._colmena_charts: dict[str, dict] = {}
+        self._used_chart_ids: set[str] = set()
         self.template_service = template_service or TemplateService()
         self.citation_service = citation_service or CitationService()
 
@@ -84,6 +97,7 @@ class DocxService:
         sections: list[SectionRead],
         references: list[ReferenceRead],
         style: CitationStyle = CitationStyle.APA7,
+        colmena_charts: list[dict] | None = None,
     ) -> DocumentResponse:
         template_path = self.template_service.get_template_path(style)
         document = Document(template_path)
@@ -92,7 +106,14 @@ class DocxService:
         self._add_cover(document, thesis)
         self._add_table_of_contents(document, sections)
         reference_tags = self._reference_tags(references)
+        self._figure_counter = 0
+        # Gráficas de Colmena importadas a la tesis, indexadas por artifact_id.
+        self._colmena_charts = {
+            str(chart.get("colmena_artifact_id")): chart for chart in (colmena_charts or [])
+        }
+        self._used_chart_ids = set()
         self._add_sections(document, sections, references, reference_tags, style)
+        self._append_unplaced_colmena_charts(document)
         self._add_references(document, references, style)
         self._enable_auto_field_update(document)
 
@@ -520,7 +541,7 @@ class DocxService:
             for block in section.content.split("\n\n"):
                 text = block.strip()
                 if text:
-                    self._add_content_paragraph(document, text, reference_lookup)
+                    self._render_content_block(document, text, reference_lookup)
 
             for index, subsection in enumerate(self._section_subsections(section), start=1):
                 subsection_title = str(subsection.title).strip()
@@ -537,7 +558,7 @@ class DocxService:
                 for block in subsection_content.split("\n\n"):
                     text = block.strip()
                     if text:
-                        self._add_content_paragraph(document, text, reference_lookup)
+                        self._render_content_block(document, text, reference_lookup)
 
     def _section_subsections(self, section: SectionRead) -> list[SimpleNamespace]:
         legacy_subtitle = (section.subtitle or "").strip()
@@ -591,6 +612,126 @@ class DocxService:
             lookup[reference_id.hex.lower()] = value
             lookup[reference_tags[reference_id].lower()] = value
         return lookup
+
+    def _render_content_block(
+        self,
+        document: Document,
+        text: str,
+        reference_lookup: dict[str, tuple[str, str]],
+    ) -> None:
+        figure = self._parse_colmena_figure(text)
+        if figure is not None:
+            self._add_colmena_figure(
+                document, figure["form"], figure["artifact"], figure["caption"]
+            )
+            return
+        self._add_content_paragraph(document, text, reference_lookup)
+
+    def _parse_colmena_figure(self, text: str) -> dict[str, str] | None:
+        match = COLMENA_FIGURE_PATTERN.fullmatch(text.strip())
+        if match is None:
+            return None
+        return {
+            "form": match.group("form"),
+            "artifact": match.group("artifact"),
+            "caption": (match.group("caption") or "").strip(),
+        }
+
+    def _decode_data_base64(self, data_b64: str | None) -> bytes | None:
+        if not data_b64:
+            return None
+        if "," in data_b64 and data_b64.strip().startswith("data:"):
+            data_b64 = data_b64.split(",", 1)[1]
+        try:
+            return base64.b64decode(data_b64)
+        except Exception:
+            return None
+
+    def _fetch_colmena_chart_png(self, form_id: str, artifact_id: str) -> bytes | None:
+        # 1) Preferir la gráfica ya importada a la tesis (colmena_graficos_tesis).
+        stored = self._colmena_charts.get(str(artifact_id))
+        if stored is not None:
+            png = self._decode_data_base64(stored.get("data_base64"))
+            if png:
+                return png
+        # 2) Fallback: pedirla en vivo al backend de Colmena.
+        url = (
+            f"{self.colmena_api_base_url}/api/v1/forms/{form_id}"
+            f"/chart-images/{artifact_id}/base64"
+        )
+        try:
+            with urlopen(url, timeout=10) as response:  # noqa: S310 (host propio)
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception as error:  # red caída, 404, JSON inválido, etc.
+            logger.warning(
+                "No se pudo obtener la gráfica de Colmena %s/%s: %s",
+                form_id,
+                artifact_id,
+                error,
+            )
+            return None
+        data_b64 = payload.get("data_base64") or ""
+        if not data_b64:
+            data_url = payload.get("data_url") or ""
+            if "," in data_url:
+                data_b64 = data_url.split(",", 1)[1]
+        if not data_b64:
+            return None
+        try:
+            return base64.b64decode(data_b64)
+        except Exception as error:
+            logger.warning("Base64 inválido para gráfica %s/%s: %s", form_id, artifact_id, error)
+            return None
+
+    def _add_colmena_figure(
+        self,
+        document: Document,
+        form_id: str,
+        artifact_id: str,
+        caption: str,
+    ) -> None:
+        self._used_chart_ids.add(str(artifact_id))
+        self._figure_counter += 1
+        number = self._figure_counter
+
+        stored = self._colmena_charts.get(str(artifact_id))
+        if not caption and stored is not None:
+            caption = str(stored.get("titulo") or "").strip()
+
+        png_bytes = self._fetch_colmena_chart_png(form_id, artifact_id)
+        if png_bytes:
+            image_paragraph = document.add_paragraph()
+            image_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            section = document.sections[-1]
+            content_width = int(section.page_width - section.left_margin - section.right_margin)
+            image_paragraph.add_run().add_picture(BytesIO(png_bytes), width=content_width)
+
+        caption_paragraph = document.add_paragraph()
+        caption_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        label_run = caption_paragraph.add_run(f"Figura {number}. ")
+        label_run.bold = True
+        label_run.font.color.rgb = COLMENA_AMBER
+        if caption:
+            caption_run = caption_paragraph.add_run(caption)
+            caption_run.font.color.rgb = COLMENA_AMBER
+
+    def _append_unplaced_colmena_charts(self, document: Document) -> None:
+        """Anexa las gráficas importadas a la tesis que ningún marcador colocó inline."""
+        pending = [
+            chart
+            for artifact_id, chart in self._colmena_charts.items()
+            if artifact_id not in self._used_chart_ids
+        ]
+        if not pending:
+            return
+        self._add_heading(document, "Figuras", 1, {})
+        for chart in pending:
+            self._add_colmena_figure(
+                document,
+                str(chart.get("colmena_form_id") or ""),
+                str(chart.get("colmena_artifact_id") or ""),
+                str(chart.get("titulo") or "").strip(),
+            )
 
     def _add_content_paragraph(
         self,
@@ -1017,6 +1158,274 @@ finally:
         finally:
             if tmp_path.exists():
                 tmp_path.unlink()
+
+    def append_bibliography_field(
+        self,
+        path: Path,
+        references: list[ReferenceRead],
+        style: CitationStyle,
+        remove_texts: list[str] | None = None,
+    ) -> None:
+        """Inserta en el cuerpo del documento una bibliografía nativa de Word:
+        un encabezado «Referencias» seguido de un campo ``BIBLIOGRAPHY``
+        actualizable, con las entradas ya renderizadas como resultado en caché.
+
+        Así el documento exportado muestra la bibliografía aunque Word aún no
+        haya cargado la lista de fuentes, y el estudiante puede refrescarla con
+        el botón de bibliografía de Word.
+
+        Es idempotente: si ya existe un campo de bibliografía (uno que hayamos
+        insertado antes o uno nativo de Word), se elimina y se vuelve a generar.
+
+        ``remove_texts`` son las líneas de texto plano de las que se extrajeron
+        las referencias (su ``raw_text``). Se borran del cuerpo —solo esos
+        párrafos exactos, más el encabezado «Referencias» si queda huérfano—
+        para dejar una sola versión: el campo de bibliografía generado.
+        """
+        if not references:
+            return
+
+        style = self._supported_metadata_style(style)
+        document = Document(path)
+        self._remove_existing_bibliography_field(document)
+        if remove_texts:
+            self._remove_plain_text_references(document, remove_texts)
+        self._add_references(document, references, style)
+        self._enable_auto_field_update(document)
+        document.save(path)
+
+    def _remove_plain_text_references(
+        self,
+        document: Document,
+        source_texts: list[str],
+    ) -> int:
+        targets = {
+            key
+            for key in (self._normalize_ref_line(text) for text in source_texts)
+            if key
+        }
+        if not targets:
+            return 0
+
+        paragraphs = list(document.paragraphs)
+        remove = [False] * len(paragraphs)
+
+        # 1) Párrafos cuyo texto coincide exactamente con una línea extraída.
+        for index, paragraph in enumerate(paragraphs):
+            key = self._normalize_ref_line(paragraph.text)
+            if key and key in targets:
+                remove[index] = True
+
+        # 2) Encabezado «Referencias»/«Bibliografía» que queda huérfano (todo su
+        #    bloque, hasta el siguiente encabezado o el final, fue removido).
+        for index, paragraph in enumerate(paragraphs):
+            if not self._is_reference_heading_text(paragraph.text):
+                continue
+            orphan = True
+            for follower_index in range(index + 1, len(paragraphs)):
+                follower = paragraphs[follower_index]
+                if self._is_heading_paragraph(follower):
+                    break
+                if follower.text.strip() and not remove[follower_index]:
+                    orphan = False
+                    break
+            if orphan:
+                remove[index] = True
+
+        removed = 0
+        for index, paragraph in enumerate(paragraphs):
+            if not remove[index]:
+                continue
+            element = paragraph._p
+            parent = element.getparent()
+            if parent is not None:
+                parent.remove(element)
+                removed += 1
+        return removed
+
+    def _is_heading_paragraph(self, paragraph) -> bool:
+        name = str(getattr(getattr(paragraph, "style", None), "name", "") or "")
+        return bool(re.search(r"(?:heading|t[ií]tulo|encabezado)", name, re.IGNORECASE))
+
+    def _normalize_ref_line(self, text: str) -> str:
+        clean = re.sub(r"\s+", " ", str(text or "")).strip()
+        clean = re.sub(r"^\s*(\[\d+\]|\d+[.)])\s*", "", clean)
+        return clean.strip().lower()
+
+    def _remove_existing_bibliography_field(self, document: Document) -> None:
+        paragraphs = list(document.paragraphs)
+        begin_index: int | None = None
+        end_index: int | None = None
+
+        for index, paragraph in enumerate(paragraphs):
+            xml = paragraph._p.xml
+            if begin_index is None:
+                is_field_start = "BIBLIOGRAPHY" in xml and (
+                    "instrText" in xml or "fldSimple" in xml
+                )
+                if is_field_start:
+                    begin_index = index
+                    if 'w:fldCharType="end"' in xml or "fldSimple" in xml:
+                        end_index = index
+                        break
+            else:
+                end_index = index
+                if 'w:fldCharType="end"' in xml:
+                    break
+
+        if begin_index is None:
+            return
+        if end_index is None:
+            end_index = begin_index
+
+        start = begin_index
+        if start > 0 and self._is_reference_heading_text(paragraphs[start - 1].text):
+            start -= 1
+
+        for paragraph in paragraphs[start : end_index + 1]:
+            element = paragraph._p
+            parent = element.getparent()
+            if parent is not None:
+                parent.remove(element)
+
+    def _is_reference_heading_text(self, text: str) -> bool:
+        normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower().strip(" .:")
+        return normalized in {
+            "referencias",
+            "bibliografia",
+            "bibliografía",
+            "references",
+            "bibliography",
+        }
+
+    def imbue_bibliography_metadata(
+        self,
+        path: Path,
+        references: list[ReferenceRead],
+        style: CitationStyle,
+    ) -> None:
+        """Incrusta las referencias como fuentes nativas de Word (customXml) en un
+        .docx/.docm ya existente (por ejemplo, el avance Word subido por el
+        estudiante) sin destruir otros customXml que el archivo ya tuviera.
+
+        A diferencia de :meth:`_write_bibliography_metadata` —que asume el slot
+        fijo ``item1.xml`` de las plantillas generadas— esta variante detecta el
+        slot de bibliografía existente (o asigna el siguiente ``itemN.xml``
+        libre) para operar de forma segura sobre documentos arbitrarios.
+        """
+        if not references:
+            return
+
+        style = self._supported_metadata_style(style)
+        reference_tags = self._reference_tags(references)
+
+        with ZipFile(path, "r") as archive:
+            names = set(archive.namelist())
+            content_types_xml = archive.read(CONTENT_TYPES) if CONTENT_TYPES in names else None
+            document_rels_xml = archive.read(DOCUMENT_RELS) if DOCUMENT_RELS in names else None
+            index = self._bibliography_item_index(archive, names)
+            item_name = f"customXml/item{index}.xml"
+            item_props_name = f"customXml/itemProps{index}.xml"
+            item_rels_name = f"customXml/_rels/item{index}.xml.rels"
+            item_rels_xml = archive.read(item_rels_name) if item_rels_name in names else None
+            item_props_xml = archive.read(item_props_name) if item_props_name in names else None
+
+        replacements = {
+            item_name: self._build_sources_xml(references, style, reference_tags),
+            item_props_name: item_props_xml or self._build_item_props_xml(),
+            item_rels_name: self._ensure_item_rels_xml_for(item_rels_xml, index),
+            CONTENT_TYPES: self._ensure_content_types_xml_for(content_types_xml, item_props_name),
+            DOCUMENT_RELS: self._ensure_document_rels_xml_for(document_rels_xml, item_name),
+        }
+
+        with NamedTemporaryFile(dir=path.parent, delete=False, suffix=path.suffix or ".docx") as tmp:
+            tmp_path = Path(tmp.name)
+
+        try:
+            with ZipFile(path, "r") as source, ZipFile(tmp_path, "w", ZIP_DEFLATED) as target:
+                for item in source.infolist():
+                    if item.filename in replacements:
+                        continue
+                    target.writestr(item, source.read(item.filename))
+
+                for filename, payload in replacements.items():
+                    target.writestr(filename, payload)
+            tmp_path.replace(path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
+    def _supported_metadata_style(self, style: CitationStyle) -> CitationStyle:
+        supported = {
+            CitationStyle.APA7,
+            CitationStyle.VANCOUVER,
+            CitationStyle.IEEE,
+            CitationStyle.ISO690,
+        }
+        return style if style in supported else CitationStyle.APA7
+
+    def _bibliography_item_index(self, archive: ZipFile, names: set[str]) -> int:
+        item_pattern = re.compile(r"^customXml/item(\d+)\.xml$")
+        used: set[int] = set()
+        for name in sorted(names):
+            match = item_pattern.match(name)
+            if not match:
+                continue
+            index = int(match.group(1))
+            used.add(index)
+            try:
+                root = ET.fromstring(archive.read(name))
+            except ET.ParseError:
+                continue
+            if self._local_name(root.tag) == "Sources":
+                return index
+
+        index = 1
+        while index in used:
+            index += 1
+        return index
+
+    def _ensure_item_rels_xml_for(self, xml: bytes | None, index: int) -> bytes:
+        root = self._relationships_root(xml)
+        target = f"itemProps{index}.xml"
+        if not self._has_relationship(root, CUSTOM_XML_PROPS_REL, target):
+            ET.SubElement(
+                root,
+                f"{{{RELATIONSHIPS_NS}}}Relationship",
+                {
+                    "Id": self._next_relationship_id(root),
+                    "Type": CUSTOM_XML_PROPS_REL,
+                    "Target": target,
+                },
+            )
+        return self._xml_bytes(root)
+
+    def _ensure_document_rels_xml_for(self, xml: bytes | None, item_name: str) -> bytes:
+        root = self._relationships_root(xml)
+        target = f"../{item_name}"
+        if not self._has_relationship(root, CUSTOM_XML_REL, target):
+            ET.SubElement(
+                root,
+                f"{{{RELATIONSHIPS_NS}}}Relationship",
+                {
+                    "Id": self._next_relationship_id(root),
+                    "Type": CUSTOM_XML_REL,
+                    "Target": target,
+                },
+            )
+        return self._xml_bytes(root)
+
+    def _ensure_content_types_xml_for(self, xml: bytes | None, item_props_name: str) -> bytes:
+        root = self._content_types_root(xml)
+        self._ensure_content_type_override(
+            root,
+            f"/{item_props_name}",
+            BIBLIOGRAPHY_CONTENT_TYPE,
+        )
+        return self._xml_bytes(root)
+
+    def _local_name(self, tag: str) -> str:
+        return str(tag).rsplit("}", 1)[-1]
 
     def _build_sources_xml(
         self,

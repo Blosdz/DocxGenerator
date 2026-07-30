@@ -1,6 +1,7 @@
 from uuid import UUID
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 
 from app.core.config import get_settings
@@ -19,6 +20,7 @@ from app.models.documents import (
     RawDataUpdateRequest,
     RawDataResponse,
     RawDocumentResponse,
+    SectionReferenceExtractRequest,
     StructuredReferenceUpdate,
     StructuredSectionUpdate,
     SubtitleInsertRequest,
@@ -58,7 +60,11 @@ async def generate_docx(
 ) -> DocumentResponse:
     payload = payload or GenerateDocumentRequest()
     backend_url = request.headers.get("x-backend-base-url") or get_settings().backend_url
-    return get_builder().build_docx(
+    # build_docx es bloqueante y, con upload_to_backend, el backend Nest vuelve a
+    # llamar a este servicio (/documents/{id}/process). Lo corremos en un threadpool
+    # para no bloquear el event loop y evitar el deadlock reentrante.
+    return await run_in_threadpool(
+        get_builder().build_docx,
         tesis_id,
         upload_to_backend=payload.upload_to_backend,
         backend_url=backend_url,
@@ -181,6 +187,24 @@ async def extract_references(document_id: UUID) -> ExtractedReferencesResponse:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@router.post(
+    "/documents/{document_id}/references/extract-section",
+    response_model=ExtractedReferencesResponse,
+)
+async def extract_section_references(
+    document_id: UUID,
+    payload: SectionReferenceExtractRequest,
+) -> ExtractedReferencesResponse:
+    try:
+        return ExtractedReferencesResponse(
+            **get_reference_extraction_service().extract_section_and_create(
+                document_id, payload.text
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @router.post("/documents/{document_id}/outline/extract", response_model=ExtractedOutlineResponse)
 async def extract_outline(
     document_id: UUID,
@@ -250,6 +274,23 @@ async def insert_subtitle(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/documents/{document_id}/download")
+async def download_editable_document(document_id: UUID) -> FileResponse:
+    """Descarga el DOCX editable tal cual (el avance de trabajo, ya imbuido con
+    las referencias), sin reconstruirlo ni subirlo a Drive."""
+    try:
+        context = get_repository().get_editable_document_context(document_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    filename = context["filename"]
+    return FileResponse(
+        path=context["path"],
+        media_type=DOCM_MIME if filename.lower().endswith(".docm") else DOCX_MIME,
+        filename=filename,
+    )
 
 
 @router.get("/documents/{filename}")

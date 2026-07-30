@@ -159,7 +159,13 @@ class ExtractedReferencesResponse(BaseModel):
     extracted_count: int = 0
     created_count: int = 0
     skipped_count: int = 0
+    imbued: bool = False
     references: list[ExtractedReferenceSummary] = Field(default_factory=list)
+
+
+class SectionReferenceExtractRequest(BaseModel):
+    text: str = Field(default="", description="Texto de la sección a analizar")
+    heading: str | None = Field(default=None, description="Título de la sección (opcional)")
 
 
 class ExtractedOutlineItem(BaseModel):

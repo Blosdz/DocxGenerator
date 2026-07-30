@@ -438,7 +438,12 @@ class DocumentsRepository:
     def get_editable_document_context(self, document_id: UUID) -> dict:
         row = self._get_document_row(document_id)
         path = self._accessible_docx_path(row)
-        return {"document_id": row["id"], "tesis_id": row["tesis_id"], "path": path}
+        return {
+            "document_id": row["id"],
+            "tesis_id": row["tesis_id"],
+            "path": path,
+            "filename": str(row.get("nombre_archivo") or path.name),
+        }
 
     def _upsert_structured_payload(self, document_id: UUID, payload: dict) -> dict:
         sections_payload = list(payload.get("sections") or [])

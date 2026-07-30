@@ -1,5 +1,7 @@
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date
+import logging
 import re
 from zipfile import BadZipFile, ZipFile
 import xml.etree.ElementTree as ET
@@ -10,6 +12,8 @@ from docx import Document
 from app.models.references import Author, CitationStyle, ReferenceCreate, ReferenceType
 from app.repositories.documents_repository import DocumentsRepository
 from app.repositories.references_repository import ReferencesRepository
+
+logger = logging.getLogger(__name__)
 
 
 REFERENCE_HEADINGS = {
@@ -81,6 +85,114 @@ class ReferenceExtractionService:
             "skipped_count": skipped_count,
             "references": references,
         }
+
+    def extract_section_and_create(
+        self,
+        document_id: UUID,
+        section_text: str,
+        imbue: bool = True,
+    ) -> dict:
+        """Extrae las bibliografías escritas como texto dentro de una sección,
+        las guarda en el store de referencias de la tesis (dedup) y —opcional—
+        imbuye el documento editable con la metadata nativa de Word."""
+        context = self.documents_repository.get_editable_document_context(document_id)
+        tesis_id = context["tesis_id"]
+        existing = self.references_repository.list_by_thesis(tesis_id)
+        existing_keys = {
+            self._reference_key(reference.title, reference.year, reference.doi)
+            for reference in existing
+        }
+
+        extracted = self.extract_from_text(section_text)
+        created_count = 0
+        skipped_count = 0
+        references: list[dict] = []
+
+        for item in extracted:
+            key = self._reference_key(item.payload.title, item.payload.year, item.payload.doi)
+            if key in existing_keys:
+                skipped_count += 1
+                references.append(self._reference_summary(item, "skipped", reason="already_exists"))
+                continue
+
+            created = self.references_repository.create(tesis_id, item.payload)
+            existing_keys.add(key)
+            created_count += 1
+            references.append(self._reference_summary(item, "created", reference_id=getattr(created, "id", None)))
+
+        source_texts = [item.raw_text for item in extracted if item.raw_text]
+        imbued = False
+        if imbue and (created_count > 0 or existing):
+            imbued = self._imbue_document(context["path"], tesis_id, source_texts)
+
+        return {
+            "document_id": context["document_id"],
+            "tesis_id": tesis_id,
+            "extracted_count": len(extracted),
+            "created_count": created_count,
+            "skipped_count": skipped_count,
+            "imbued": imbued,
+            "references": references,
+        }
+
+    def extract_from_text(self, text: str) -> list[ExtractedReference]:
+        entries = self._reference_entries_from_text(text)
+        parsed = [
+            reference
+            for reference in (self._parse_reference(entry) for entry in entries)
+            if reference is not None
+        ]
+        return self._deduplicate_extracted(parsed)
+
+    def _reference_entries_from_text(self, text: str) -> list[str]:
+        entries: list[str] = []
+        for block in re.split(r"\n{2,}", str(text or "")):
+            for line in block.split("\n"):
+                clean = self._clean_spaces(line)
+                if not clean:
+                    continue
+                entry = self._strip_numbering(clean)
+                if entry:
+                    entries.append(entry)
+        return entries
+
+    def _imbue_document(self, path, tesis_id: UUID, source_texts: list[str] | None = None) -> bool:
+        references = self.references_repository.list_by_thesis(tesis_id)
+        if not references:
+            return False
+        try:
+            # Import perezoso para evitar acoplar la extracción con la generación
+            # de DOCX (docx_service arrastra plantillas, docxcompose, etc.).
+            from app.services.docx_service import DocxService
+
+            style = self._imbue_style(references)
+            service = DocxService()
+            # 1) Bibliografía visible en el cuerpo: borra el listado-texto fuente
+            #    y lo reemplaza por el campo BIBLIOGRAPHY (python-docx guarda).
+            service.append_bibliography_field(path, references, style, remove_texts=source_texts)
+            # 2) Fuentes nativas en customXml — al final, por cirugía de zip, para
+            #    que la metadata quede como autoridad y no la pise python-docx.
+            service.imbue_bibliography_metadata(path, references, style)
+            return True
+        except Exception:
+            logger.warning(
+                "No se pudo imbuir la metadata de bibliografía en %s", path, exc_info=True
+            )
+            return False
+
+    def _imbue_style(self, references) -> CitationStyle:
+        supported = {
+            CitationStyle.APA7,
+            CitationStyle.VANCOUVER,
+            CitationStyle.IEEE,
+            CitationStyle.ISO690,
+        }
+        counts = Counter(
+            reference.style for reference in references if reference.style in supported
+        )
+        if counts:
+            return counts.most_common(1)[0][0]
+        return CitationStyle.APA7
 
     def extract_from_path(self, path) -> list[ExtractedReference]:
         document = Document(path)
