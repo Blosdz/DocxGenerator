@@ -1,6 +1,0 @@
-#!/media/velorie/f82c635f-24d6-435b-961b-652be2b66b775/TRABAJO/AEIA/thesis/fullProyect/thesis-doc-generator/.venv/bin/python
-import sys
-from pytest import console_main
-if __name__ == '__main__':
-    sys.argv[0] = sys.argv[0].removesuffix('.exe')
-    sys.exit(console_main())

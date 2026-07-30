@@ -1,8 +1,0 @@
-#!/media/velorie/f82c635f-24d6-435b-961b-652be2b66b77/TRABAJO/AEIA/thesis/fullProyect/thesis-doc-generator/venv/bin/python3
-# -*- coding: utf-8 -*-
-import re
-import sys
-from pygments.cmdline import main
-if __name__ == '__main__':
-    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
-    sys.exit(main())
