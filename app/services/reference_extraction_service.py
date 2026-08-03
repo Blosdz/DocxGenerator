@@ -35,6 +35,48 @@ WORD_SOURCE_TYPES = {
     "electronicsource": ReferenceType.WEB,
 }
 
+# Anotaciones de estilo ISO 690 / repositorios institucionales que no son
+# parte del titulo ni del anio: hay que aislarlas antes de partir la
+# referencia en autor/anio/titulo para que no contaminen esos campos.
+ONLINE_TAG_RE = re.compile(r"\[\s*(?:en\s*l[ií]nea|online|internet)\s*\]", re.IGNORECASE)
+AVAILABLE_AT_RE = re.compile(
+    r"\b(?:disponible\s+en|recuperado\s+de|available\s+at)\s*:?\s*(?=https?://)",
+    re.IGNORECASE,
+)
+NO_DATE_RE = re.compile(r"\b(?:s\.\s*f\.?|n\.\s*d\.?)\b", re.IGNORECASE)
+NO_DATE_PLACEHOLDER = "SINFECHA"
+
+ACCESS_DATE_ISO_RE = re.compile(
+    r"\[?\s*(?:fecha\s+de\s+)?(?:consulta|consultado(?:\s+el)?|accessed|cited|recuperado(?:\s+el)?)\s*:?\s*"
+    r"(?P<date>\d{4}-\d{2}-\d{2})\s*\]?",
+    re.IGNORECASE,
+)
+ACCESS_DATE_ES_RE = re.compile(
+    r"\[?\s*(?:fecha\s+de\s+)?(?:consulta|consultado(?:\s+el)?|recuperado(?:\s+el)?)\s*:?\s*"
+    r"(?P<day>\d{1,2})\s+de\s+(?P<month>[a-záéíóúñ]+)\s+de\s+(?P<year>\d{4})\s*\]?",
+    re.IGNORECASE,
+)
+ACCESS_DATE_EN_RE = re.compile(
+    r"\[?\s*accessed\s*:?\s*(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),?\s+(?P<year>\d{4})\s*\]?",
+    re.IGNORECASE,
+)
+
+SPANISH_MONTHS = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+    "julio": 7, "agosto": 8, "septiembre": 9, "setiembre": 9, "octubre": 10,
+    "noviembre": 11, "diciembre": 12,
+}
+ENGLISH_MONTHS = {
+    name.lower(): index
+    for index, name in enumerate(
+        [
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December",
+        ],
+        start=1,
+    )
+}
+
 
 @dataclass
 class ExtractedReference:
@@ -52,12 +94,13 @@ class ReferenceExtractionService:
         self.documents_repository = documents_repository or DocumentsRepository()
         self.references_repository = references_repository or ReferencesRepository()
 
-    def extract_and_create(self, document_id: UUID) -> dict:
+    def extract_and_create(self, document_id: UUID, imbue: bool = True) -> dict:
         context = self.documents_repository.get_editable_document_context(document_id)
         tesis_id = context["tesis_id"]
+        existing = self.references_repository.list_by_thesis(tesis_id)
         existing_keys = {
             self._reference_key(reference.title, reference.year, reference.doi)
-            for reference in self.references_repository.list_by_thesis(tesis_id)
+            for reference in existing
         }
 
         extracted = self.extract_from_path(context["path"])
@@ -77,12 +120,22 @@ class ReferenceExtractionService:
             created_count += 1
             references.append(self._reference_summary(item, "created", reference_id=getattr(created, "id", None)))
 
+        # Sin esto, las referencias quedaban solo en el store de la tesis: el
+        # .docx que se descarga (download_editable_document) sirve el archivo
+        # tal cual está en disco, así que si nunca se imbuye aquí, el Word
+        # descargado nunca trae las citas en su metadata nativa (customXml).
+        source_texts = [item.raw_text for item in extracted if item.raw_text and item.source == "text"]
+        imbued = False
+        if imbue and (created_count > 0 or existing):
+            imbued = self._imbue_document(context["path"], tesis_id, source_texts)
+
         return {
             "document_id": context["document_id"],
             "tesis_id": tesis_id,
             "extracted_count": len(extracted),
             "created_count": created_count,
             "skipped_count": skipped_count,
+            "imbued": imbued,
             "references": references,
         }
 
@@ -237,12 +290,15 @@ class ReferenceExtractionService:
         if len(clean) < 12:
             return None
 
-        year = self._extract_year(clean)
+        accessed_at = self._extract_accessed_at(clean)
+        clean = self._strip_annotations(clean)
+        if len(clean) < 12:
+            return None
+
         doi = self._extract_doi(clean)
         url = self._extract_url(clean)
-        authors_text, remainder = self._split_authors(clean)
+        authors_text, year, title, remainder = self._split_reference(clean)
         authors = self._parse_authors(authors_text)
-        title = self._extract_title(remainder)
         if not authors or not title:
             return None
 
@@ -257,6 +313,7 @@ class ReferenceExtractionService:
             journal=journal,
             doi=doi,
             url=url,
+            accessed_at=accessed_at,
             style=CitationStyle.APA7,
         )
         return ExtractedReference(payload=payload, raw_text=text, source="text")
@@ -440,22 +497,52 @@ class ReferenceExtractionService:
             "reason": reason,
         }
 
-    def _split_authors(self, text: str) -> tuple[str, str]:
+    def _split_reference(self, text: str) -> tuple[str, int | None, str | None, str]:
+        """Separa autor / anio / titulo / resto de una referencia en texto.
+
+        Soporta tanto el orden APA ``Autor (Anio). Titulo...`` como el orden
+        ISO 690 / repositorios ``Autor. Titulo. Institucion, Anio. URL``,
+        donde el titulo va *antes* del anio. La version anterior asumia que
+        todo lo posterior al anio era el titulo, así que en ese segundo
+        formato terminaba usando basura (fecha de consulta, URL) como
+        titulo y perdía el titulo real.
+        """
         apa_match = re.search(r"\(\s*(\d{4}|s\.?\s*f\.?|n\.?\s*d\.?)\s*\)", text, re.IGNORECASE)
         if apa_match:
-            return text[: apa_match.start()].strip(" ."), text[apa_match.end() :].strip(" .")
+            authors_text = text[: apa_match.start()].strip(" .")
+            year = self._year_or_none(apa_match.group(1))
+            remainder = text[apa_match.end() :].strip(" .")
+            return authors_text, year, self._extract_title(remainder), remainder
 
-        year_match = re.search(r"\b(1[5-9]|20)\d{2}\b", text)
-        if year_match:
-            before_year = text[: year_match.start()].strip(" .,")
-            parts = before_year.split(".")
-            if parts:
-                return parts[0].strip(), text[year_match.end() :].strip(" .")
+        segments = [segment.strip() for segment in text.split(".") if segment.strip()]
+        if not segments:
+            return "", None, None, text
 
-        parts = text.split(".", 1)
-        if len(parts) == 2:
-            return parts[0].strip(), parts[1].strip()
-        return "", text
+        for index in range(1, len(segments)):
+            segment = segments[index]
+            year_match = re.search(r"\b(1[5-9]|20)\d{2}\b", segment)
+            is_no_date = segment.strip(" ,;[]") == NO_DATE_PLACEHOLDER
+            if not year_match and not is_no_date:
+                continue
+
+            authors_text = segments[0]
+            year = int(year_match.group(0)) if year_match else None
+            title = ". ".join(segments[1:index]).strip()
+            if not title and year_match:
+                # El anio viene pegado al mismo segmento que el autor o la
+                # institucion (no hay un segmento de titulo propio): nos
+                # quedamos con lo que precede al anio como mejor esfuerzo.
+                title = segment[: year_match.start()].strip(" ,;") or None
+            remainder = ". ".join(segments[index + 1 :])
+            return authors_text, year, title or None, remainder
+
+        authors_text = segments[0]
+        remainder = ". ".join(segments[1:])
+        return authors_text, None, self._extract_title(remainder), remainder
+
+    def _year_or_none(self, token: str) -> int | None:
+        match = re.match(r"\d{4}", token)
+        return int(match.group(0)) if match else None
 
     def _parse_authors(self, text: str) -> list[Author]:
         text = re.sub(r"\s+&\s+", ", ", text)
@@ -517,9 +604,42 @@ class ReferenceExtractionService:
         parts = [part.strip() for part in after_title.split(".") if part.strip()]
         return parts[0][:300] if parts else None
 
-    def _extract_year(self, text: str) -> int | None:
-        match = re.search(r"\b(1[5-9]|20)\d{2}\b", text)
-        return int(match.group(0)) if match else None
+    def _strip_annotations(self, text: str) -> str:
+        text = ACCESS_DATE_ISO_RE.sub("", text)
+        text = ACCESS_DATE_ES_RE.sub("", text)
+        text = ACCESS_DATE_EN_RE.sub("", text)
+        text = AVAILABLE_AT_RE.sub("", text)
+        text = ONLINE_TAG_RE.sub("", text)
+        text = NO_DATE_RE.sub(NO_DATE_PLACEHOLDER, text)
+        return self._clean_spaces(text)
+
+    def _extract_accessed_at(self, text: str) -> date | None:
+        match = ACCESS_DATE_ISO_RE.search(text)
+        if match:
+            try:
+                return date.fromisoformat(match.group("date"))
+            except ValueError:
+                return None
+
+        match = ACCESS_DATE_ES_RE.search(text)
+        if match:
+            month = SPANISH_MONTHS.get(match.group("month").lower())
+            if month:
+                try:
+                    return date(int(match.group("year")), month, int(match.group("day")))
+                except ValueError:
+                    return None
+            return None
+
+        match = ACCESS_DATE_EN_RE.search(text)
+        if match:
+            month = ENGLISH_MONTHS.get(match.group("month").lower())
+            if month:
+                try:
+                    return date(int(match.group("year")), month, int(match.group("day")))
+                except ValueError:
+                    return None
+        return None
 
     def _extract_doi(self, text: str) -> str | None:
         match = re.search(r"(?:doi:\s*|https?://doi\.org/)(10\.\S+)", text, re.IGNORECASE)
