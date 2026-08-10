@@ -2,8 +2,15 @@ from uuid import UUID
 
 from fastapi import APIRouter, status
 
-from app.models.references import ReferenceCreate, ReferenceDeleteResponse, ReferenceRead, ReferenceUpdate
+from app.models.references import (
+    ReferenceCreate,
+    ReferenceDeleteResponse,
+    ReferenceRead,
+    ReferenceUpdate,
+    VerifySourceRequest,
+)
 from app.repositories.references_repository import ReferencesRepository
+from app.services.source_verification_service import SourceVerificationService
 
 
 router = APIRouter(tags=["references"])
@@ -40,3 +47,11 @@ async def update_reference(reference_id: UUID, payload: ReferenceUpdate) -> Refe
 @router.delete("/references/{reference_id}", response_model=ReferenceDeleteResponse)
 async def delete_reference(reference_id: UUID) -> ReferenceDeleteResponse:
     return get_repository().delete(reference_id)
+
+
+@router.post("/references/{reference_id}/verify", response_model=ReferenceRead)
+async def verify_reference_source(reference_id: UUID, payload: VerifySourceRequest) -> ReferenceRead:
+    repository = get_repository()
+    reference = repository.get(reference_id)
+    verification = await SourceVerificationService().verify_quote(reference.url, payload.quote)
+    return repository.update(reference_id, ReferenceUpdate(source_verification=verification))

@@ -14,7 +14,8 @@ from app.services.outline_extraction_service import OutlineExtractionService
 from app.services.reference_extraction_service import ReferenceExtractionService
 from app.main import app
 from app.models.documents import DocumentResponse
-from app.models.references import ReferenceDeleteResponse
+from app.models.references import ReferenceDeleteResponse, SourceVerification, VerificationStatus
+from app.repositories.errors import RepositoryNotFoundError
 from app.models.thesis import SectionRead, ThesisRead
 from app.repositories.documents_repository import DocumentsRepository
 from app.repositories.thesis_repository import ThesisRepository
@@ -226,7 +227,7 @@ class FakeReferenceExtractionService:
 
 
 class FakeOutlineExtractionService:
-    def extract_and_create(self, document_id):
+    def extract_and_create(self, document_id, replace: bool = False):
         return {
             "document_id": document_id,
             "tesis_id": uuid4(),
@@ -1059,3 +1060,109 @@ def test_reference_routes_use_repository(monkeypatch) -> None:
     assert created["title"] == "Notas"
     assert updated["title"] == "Notas actualizadas"
     assert deleted == {"id": str(reference_id), "deleted": True}
+
+
+class FakeReferenceWithUrl:
+    def __init__(self, url):
+        self.url = url
+
+
+class FakeVerifyReferencesRepository:
+    def __init__(self, url="http://example.com", missing=False):
+        self.url = url
+        self.missing = missing
+        self.updated_with = None
+
+    def get(self, reference_id):
+        if self.missing:
+            raise RepositoryNotFoundError(f"Reference {reference_id} was not found")
+        return FakeReferenceWithUrl(url=self.url)
+
+    def update(self, reference_id, payload):
+        self.updated_with = payload
+        now = datetime.now(UTC)
+        data = {
+            "id": reference_id,
+            "tesis_id": uuid4(),
+            "authors": [{"first_name": "Ada", "last_name": "Lovelace"}],
+            "year": 1843,
+            "title": "Notas",
+            "type": "book",
+            "version": 2,
+            "created_at": now,
+            "updated_at": now,
+        }
+        data.update(payload.model_dump(mode="json", exclude_unset=True))
+        return data
+
+
+class FakeSourceVerificationService:
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    async def verify_quote(self, url, quote):
+        return SourceVerification(
+            quote=quote,
+            status=VerificationStatus.FOUND_IN_BODY,
+            matched_sentence="La maquina analitica cambio la historia.",
+            in_reference_section=False,
+            verified_at=datetime.now(UTC),
+            http_status=200,
+        )
+
+
+def test_verify_reference_source_route_persists_verification(monkeypatch) -> None:
+    repository = FakeVerifyReferencesRepository()
+    monkeypatch.setattr(references, "get_repository", lambda: repository)
+    monkeypatch.setattr(references, "SourceVerificationService", FakeSourceVerificationService)
+    reference_id = uuid4()
+
+    async def scenario():
+        async with make_client() as client:
+            return await client.post(
+                f"/references/{reference_id}/verify",
+                json={"quote": "maquina analitica"},
+            )
+
+    response = run(scenario())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["source_verification"]["status"] == "found_in_body"
+    assert repository.updated_with.source_verification.status == VerificationStatus.FOUND_IN_BODY
+
+
+def test_verify_reference_source_route_returns_404_when_missing(monkeypatch) -> None:
+    repository = FakeVerifyReferencesRepository(missing=True)
+    monkeypatch.setattr(references, "get_repository", lambda: repository)
+    monkeypatch.setattr(references, "SourceVerificationService", FakeSourceVerificationService)
+    reference_id = uuid4()
+
+    async def scenario():
+        async with make_client() as client:
+            return await client.post(
+                f"/references/{reference_id}/verify",
+                json={"quote": "algo"},
+            )
+
+    response = run(scenario())
+
+    assert response.status_code == 404
+
+
+def test_verify_reference_source_route_rejects_empty_quote(monkeypatch) -> None:
+    repository = FakeVerifyReferencesRepository()
+    monkeypatch.setattr(references, "get_repository", lambda: repository)
+    monkeypatch.setattr(references, "SourceVerificationService", FakeSourceVerificationService)
+    reference_id = uuid4()
+
+    async def scenario():
+        async with make_client() as client:
+            return await client.post(
+                f"/references/{reference_id}/verify",
+                json={"quote": ""},
+            )
+
+    response = run(scenario())
+
+    assert response.status_code == 422

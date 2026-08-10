@@ -25,6 +25,30 @@ class Author(BaseModel):
     last_name: str
 
 
+class VerificationStatus(StrEnum):
+    FOUND_IN_BODY = "found_in_body"
+    FOUND_IN_REFERENCES_SECTION = "found_in_references_section"
+    NOT_FOUND = "not_found"
+    FETCH_FAILED = "fetch_failed"
+    INVALID_CONTENT_TYPE = "invalid_content_type"
+    NO_URL = "no_url"
+    ERROR = "error"
+
+
+class SourceVerification(BaseModel):
+    quote: str
+    status: VerificationStatus
+    matched_sentence: str | None = None
+    in_reference_section: bool | None = None
+    verified_at: datetime
+    http_status: int | None = None
+    detail: str | None = None
+
+
+class VerifySourceRequest(BaseModel):
+    quote: str = Field(min_length=1, max_length=2000)
+
+
 class ReferenceBase(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -41,6 +65,7 @@ class ReferenceBase(BaseModel):
     url: str | None = None
     accessed_at: date | None = None
     style: CitationStyle = CitationStyle.APA7
+    source_verification: SourceVerification | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -89,6 +114,7 @@ class ReferenceUpdate(BaseModel):
     url: str | None = None
     accessed_at: date | None = None
     style: CitationStyle | None = None
+    source_verification: SourceVerification | None = None
 
 
 class ReferenceRead(ReferenceBase):

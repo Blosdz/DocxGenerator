@@ -8,6 +8,7 @@ from app.models.thesis import (
     SectionRead,
     SectionUpdate,
     SkeletonSectionItem,
+    SubsectionBase,
     ThesisCreate,
     ThesisRead,
 )
@@ -347,10 +348,14 @@ class ThesisRepository:
         return row
 
     def _section_from_row(self, row: dict) -> SectionRead:
+        legacy_data = row.get("data")
+        if legacy_data is not None:
+            return self._section_from_legacy_row(row, legacy_data)
+
         return SectionRead(
             id=row["id"],
             tesis_id=row["tesis_id"],
-            parent_id=row["parent_id"],
+            parent_id=row.get("parent_id"),
             title=row["title"],
             content=row.get("content") or "",
             level=row["level"],
@@ -360,4 +365,23 @@ class ThesisRepository:
             updated_at=row["updated_at"],
             deleted_at=row["deleted_at"],
             subsections=[],
+        )
+
+    def _section_from_legacy_row(self, row: dict, data: dict) -> SectionRead:
+        subtitle = data.get("subtitle")
+        subsections = [SubsectionBase(title=subtitle, content="")] if subtitle else []
+
+        return SectionRead(
+            id=row["id"],
+            tesis_id=row["tesis_id"],
+            parent_id=data.get("parent_id"),
+            title=data["title"],
+            content=data.get("content") or "",
+            level=data["level"],
+            order=data["order"],
+            version=row["version"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            deleted_at=row["deleted_at"],
+            subsections=subsections,
         )
