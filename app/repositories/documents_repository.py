@@ -1,10 +1,13 @@
 from pathlib import Path
 import re
+import shutil
+from tempfile import NamedTemporaryFile
 from uuid import UUID
 
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docx.table import Table
 from docx.text.paragraph import Paragraph
 from psycopg.types.json import Jsonb
 
@@ -438,11 +441,47 @@ class DocumentsRepository:
     def get_editable_document_context(self, document_id: UUID) -> dict:
         row = self._get_document_row(document_id)
         path = self._accessible_docx_path(row)
+        filename = self._normalize_word_filename(
+            str(row.get("nombre_archivo") or path.name),
+            path.suffix,
+        )
         return {
             "document_id": row["id"],
             "tesis_id": row["tesis_id"],
             "path": path,
-            "filename": str(row.get("nombre_archivo") or path.name),
+            "filename": filename,
+            "temporary": False,
+        }
+
+    def build_editable_document(self, document_id: UUID) -> dict:
+        """Create a download copy with manual section edits applied in place."""
+        context = self.get_editable_document_context(document_id)
+        sections = [
+            section
+            for section in self.list_sections(document_id)
+            if section.manual_override
+        ]
+        if not sections:
+            return context
+
+        suffix = context["path"].suffix.lower()
+        with NamedTemporaryFile(delete=False, suffix=suffix or ".docx") as temp_file:
+            export_path = Path(temp_file.name)
+        shutil.copy2(context["path"], export_path)
+
+        document = Document(export_path)
+        for section in sorted(
+            sections,
+            key=lambda item: min(item.source_paragraphs or [0]),
+            reverse=True,
+        ):
+            self._apply_section_to_document(document, section)
+        document.save(export_path)
+
+        return {
+            **context,
+            "path": export_path,
+            "temporary": True,
         }
 
     def _upsert_structured_payload(self, document_id: UUID, payload: dict) -> dict:
@@ -659,9 +698,15 @@ class DocumentsRepository:
         paragraphs: list[DocumentRawParagraph] | None,
     ) -> dict:
         stored = row.get("raw_data_json") if isinstance(row.get("raw_data_json"), dict) else {}
+        stored_paragraphs = (
+            stored.get("paragraphs")
+            if isinstance(stored.get("paragraphs"), list)
+            else []
+        )
         return {
             "document_id": str(row["id"]),
             "title": stored.get("title") or row.get("nombre_archivo"),
+            "preamble": stored.get("preamble") or [],
             "sections": [
                 {
                     "id": str(section.id),
@@ -689,9 +734,11 @@ class DocumentsRepository:
                 }
                 for reference in references
             ],
-            "paragraphs": [
-                paragraph.model_dump(mode="json") for paragraph in (paragraphs or [])
-            ],
+            "paragraphs": (
+                [paragraph.model_dump(mode="json") for paragraph in paragraphs]
+                if paragraphs is not None
+                else stored_paragraphs
+            ),
         }
 
     def _render_flat_text(self, raw_data_json: dict) -> str:
@@ -699,6 +746,11 @@ class DocumentsRepository:
         title = raw_data_json.get("title")
         if title:
             parts.append(str(title))
+        parts.extend(
+            str(paragraph).strip()
+            for paragraph in raw_data_json.get("preamble", [])
+            if str(paragraph).strip()
+        )
         for section in raw_data_json.get("sections", []):
             parts.append(f"{'#' * int(section.get('level') or 1)} {section.get('heading')}")
             content = str(section.get("content") or "").strip()
@@ -720,6 +772,21 @@ class DocumentsRepository:
             blocks.append(
                 DocumentPreviewBlock(kind="title", text=str(title), level=1, order_index=0)
             )
+        raw_data_json = snapshot.get("raw_data_json")
+        preamble = (
+            raw_data_json.get("preamble", [])
+            if isinstance(raw_data_json, dict)
+            else []
+        )
+        for index, paragraph in enumerate(preamble, start=1):
+            if str(paragraph).strip():
+                blocks.append(
+                    DocumentPreviewBlock(
+                        kind="paragraph",
+                        text=str(paragraph),
+                        order_index=index,
+                    )
+                )
         sections = [
             self._section_from_row(section)
             if not isinstance(section, StructuredSectionRead)
@@ -883,16 +950,30 @@ class DocumentsRepository:
         current_section: dict | None = None
         current_references = False
         preamble: list[str] = []
-        title = self._document_title(document)
+        document_paragraphs = self._document_paragraphs(document)
+        title = self._document_title(document, document_paragraphs)
         reference_candidates: list[dict] = []
+        title_consumed = False
 
-        for index, paragraph in enumerate(document.paragraphs):
+        for index, paragraph in enumerate(document_paragraphs):
             text = self._clean_text(paragraph.text)
             if not text:
                 continue
 
+            style_name = self._paragraph_style_name(paragraph)
+            if not title_consumed and text == title:
+                title_consumed = True
+                paragraphs.append(
+                    DocumentRawParagraph(
+                        paragraph_index=index,
+                        text=text,
+                        style=style_name,
+                        heading_level=1,
+                    )
+                )
+                continue
+
             heading_level = self._detect_heading_level(paragraph, text)
-            style_name = self._clean_text(getattr(getattr(paragraph, "style", None), "name", "")) or None
 
             if heading_level and not self._is_ignored_heading(text):
                 normalized_heading = self._strip_heading_numbering(text)
@@ -1137,15 +1218,89 @@ class DocumentsRepository:
             "confidence": 0.9,
         }
 
-    def _document_title(self, document: Document) -> str:
-        core_title = self._clean_text(getattr(document.core_properties, "title", "") or "")
-        if core_title:
-            return core_title
-        for paragraph in document.paragraphs:
+    def _document_paragraphs(self, document: Document) -> list[Paragraph]:
+        """Return body and table-cell paragraphs in visual reading order."""
+        paragraphs: list[Paragraph] = []
+
+        def walk(parent) -> None:
+            container = parent.element.body if hasattr(parent, "element") else parent._tc
+            for child in container.iterchildren():
+                if child.tag == qn("w:p"):
+                    paragraphs.append(Paragraph(child, parent))
+                    continue
+                if child.tag != qn("w:tbl"):
+                    continue
+                table = Table(child, parent)
+                seen_cells: set[int] = set()
+                for row in table.rows:
+                    for cell in row.cells:
+                        cell_key = id(cell._tc)
+                        if cell_key in seen_cells:
+                            continue
+                        seen_cells.add(cell_key)
+                        walk(cell)
+
+        walk(document)
+        return paragraphs
+
+    def _paragraph_style_name(self, paragraph: Paragraph) -> str | None:
+        return self._clean_text(
+            getattr(getattr(paragraph, "style", None), "name", "")
+        ) or None
+
+    def _apply_section_to_document(
+        self, document: Document, section: StructuredSectionRead
+    ) -> None:
+        source_indexes = sorted(set(section.source_paragraphs or []))
+        if not source_indexes:
+            return
+
+        paragraphs = self._document_paragraphs(document)
+        heading_index = source_indexes[0]
+        if heading_index >= len(paragraphs):
+            return
+        if self._clean_text(paragraphs[heading_index].text) != self._clean_text(section.heading):
+            self._replace_paragraph_text(paragraphs[heading_index], section.heading)
+
+        content_parts = self._split_preview_paragraphs(section.content)
+        body_indexes = [
+            index for index in source_indexes[1:] if index < len(paragraphs)
+        ]
+        for position, paragraph_index in enumerate(body_indexes):
+            text = content_parts[position] if position < len(content_parts) else ""
+            if self._clean_text(paragraphs[paragraph_index].text) != self._clean_text(text):
+                self._replace_paragraph_text(paragraphs[paragraph_index], text)
+
+        if len(content_parts) <= len(body_indexes):
+            return
+
+        anchor = paragraphs[body_indexes[-1] if body_indexes else heading_index]
+        for text in content_parts[len(body_indexes):]:
+            paragraph_element = OxmlElement("w:p")
+            anchor._p.addnext(paragraph_element)
+            anchor = Paragraph(paragraph_element, anchor._parent)
+            anchor.add_run(text)
+
+    def _normalize_word_filename(self, filename: str, fallback_suffix: str = ".docx") -> str:
+        clean = Path(filename).name.strip() or "documento"
+        repeated = re.search(r"(?i)(?:\.(?:docx|docm))+$", clean)
+        if repeated:
+            extensions = re.findall(r"(?i)\.(docx|docm)", repeated.group(0))
+            return clean[: repeated.start()] + "." + extensions[-1].lower()
+        suffix = fallback_suffix.lower() if fallback_suffix.lower() in {".docx", ".docm"} else ".docx"
+        return clean + suffix
+
+    def _document_title(
+        self,
+        document: Document,
+        paragraphs: list[Paragraph] | None = None,
+    ) -> str:
+        for paragraph in paragraphs if paragraphs is not None else self._document_paragraphs(document):
             text = self._clean_text(paragraph.text)
             if text:
                 return text[:200]
-        return "Documento"
+        core_title = self._clean_text(getattr(document.core_properties, "title", "") or "")
+        return core_title or "Documento"
 
     def _document_metadata(self, document: Document) -> dict:
         core = document.core_properties
@@ -1219,6 +1374,43 @@ class DocumentsRepository:
         # Strategy 3: Capítulo prefix
         if re.match(r"^cap[ií]tulo\s+([ivxlcdm]+|\d+)\b", text, re.IGNORECASE):
             return 1
+
+        # Strategy 4: templates and CVs commonly express hierarchy through
+        # visual formatting while every paragraph keeps the Normal style.
+        letters = [character for character in text if character.isalpha()]
+        word_count = len(text.split())
+        ends_like_sentence = bool(re.search(r"[.!?;:]$", text))
+        if (
+            len(letters) >= 3
+            and word_count <= 12
+            and len(text) <= 120
+            and all(not character.islower() for character in letters)
+            and not ends_like_sentence
+        ):
+            return 1
+
+        visible_runs = [run for run in paragraph.runs if self._clean_text(run.text)]
+        visible_length = sum(len(self._clean_text(run.text)) for run in visible_runs)
+        bold_length = sum(
+            len(self._clean_text(run.text))
+            for run in visible_runs
+            if run.bold is True
+        )
+        font_sizes = [
+            run.font.size.pt
+            for run in visible_runs
+            if run.font.size is not None
+        ]
+        is_mostly_bold = visible_length > 0 and bold_length / visible_length >= 0.6
+        is_large = bool(font_sizes) and max(font_sizes) >= 14
+        if (
+            len(letters) >= 3
+            and word_count <= 14
+            and len(text) <= 140
+            and not ends_like_sentence
+            and (is_mostly_bold or is_large)
+        ):
+            return 2
 
         return None
 
@@ -1454,7 +1646,7 @@ class DocumentsRepository:
 
     def _paragraph_at(self, document: Document, paragraph_index: int) -> Paragraph:
         try:
-            return document.paragraphs[paragraph_index]
+            return self._document_paragraphs(document)[paragraph_index]
         except IndexError as exc:
             raise ValueError("paragraph_index está fuera del rango del documento") from exc
 
@@ -1465,7 +1657,7 @@ class DocumentsRepository:
     def _raw_data_from_document(self, document: Document) -> str:
         return "\n".join(
             paragraph.text.strip()
-            for paragraph in document.paragraphs
+            for paragraph in self._document_paragraphs(document)
             if paragraph.text.strip()
         )
 
@@ -1480,7 +1672,7 @@ class DocumentsRepository:
                     "char_count": len(paragraph.text),
                     "style": paragraph.style.name if paragraph.style else None,
                 }
-                for index, paragraph in enumerate(document.paragraphs)
+                for index, paragraph in enumerate(self._document_paragraphs(document))
             ],
         }
 

@@ -3,6 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Body, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 
 from app.core.config import get_settings
 from app.models.documents import (
@@ -281,7 +282,7 @@ async def download_editable_document(document_id: UUID) -> FileResponse:
     """Descarga el DOCX editable tal cual (el avance de trabajo, ya imbuido con
     las referencias), sin reconstruirlo ni subirlo a Drive."""
     try:
-        context = get_repository().get_editable_document_context(document_id)
+        context = get_repository().build_editable_document(document_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -290,6 +291,11 @@ async def download_editable_document(document_id: UUID) -> FileResponse:
         path=context["path"],
         media_type=DOCM_MIME if filename.lower().endswith(".docm") else DOCX_MIME,
         filename=filename,
+        background=(
+            BackgroundTask(context["path"].unlink, missing_ok=True)
+            if context.get("temporary")
+            else None
+        ),
     )
 
 

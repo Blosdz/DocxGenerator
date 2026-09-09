@@ -13,7 +13,7 @@ from app.services import docx_service
 from app.services.outline_extraction_service import OutlineExtractionService
 from app.services.reference_extraction_service import ReferenceExtractionService
 from app.main import app
-from app.models.documents import DocumentResponse
+from app.models.documents import DocumentResponse, StructuredSectionRead
 from app.models.references import ReferenceDeleteResponse, SourceVerification, VerificationStatus
 from app.repositories.errors import RepositoryNotFoundError
 from app.models.thesis import SectionRead, ThesisRead
@@ -1166,3 +1166,100 @@ def test_verify_reference_source_route_rejects_empty_quote(monkeypatch) -> None:
     response = run(scenario())
 
     assert response.status_code == 422
+
+
+def test_repository_parses_table_based_word_in_reading_order(tmp_path) -> None:
+    path = tmp_path / "cv.docx"
+    docx = Document()
+    table = docx.add_table(rows=8, cols=1)
+    values = [
+        "Fernando Mahiler Chullo Mamani",
+        "Backend Engineer · AI & Software Architecture focus",
+        "PROFILE",
+        "Software engineer with distributed systems experience.",
+        "KEY HIGHLIGHTS",
+        "Reduced PR review turnaround from hours to minutes.",
+        "EXPERIENCE",
+        "Backend Engineer - Digicem",
+    ]
+    for row, value in zip(table.rows, values):
+        row.cells[0].text = value
+    table.rows[-1].cells[0].paragraphs[0].runs[0].bold = True
+    docx.save(path)
+
+    repository = DocumentsRepository()
+    payload = repository._parse_document(Document(path), uuid4(), path)
+
+    assert payload["title"] == "Fernando Mahiler Chullo Mamani"
+    assert payload["raw_data_json"]["preamble"] == [
+        "Backend Engineer · AI & Software Architecture focus"
+    ]
+    assert [section["heading"] for section in payload["sections"]] == [
+        "PROFILE",
+        "KEY HIGHLIGHTS",
+        "EXPERIENCE",
+        "Backend Engineer - Digicem",
+    ]
+    assert payload["sections"][0]["content"] == (
+        "Software engineer with distributed systems experience."
+    )
+    assert "Reduced PR review turnaround" in payload["raw_data"]
+    assert len(payload["paragraphs"]) == len(values)
+
+
+def test_word_filename_normalization_removes_duplicate_extensions() -> None:
+    repository = DocumentsRepository()
+
+    assert repository._normalize_word_filename("avance.docx.docx") == "avance.docx"
+    assert repository._normalize_word_filename("macro.docm.docm") == "macro.docm"
+    assert repository._normalize_word_filename("avance", ".docx") == "avance.docx"
+
+
+def test_build_editable_document_applies_manual_table_section_to_copy(tmp_path) -> None:
+    source_path = tmp_path / "cv.docx"
+    docx = Document()
+    table = docx.add_table(rows=3, cols=1)
+    table.rows[0].cells[0].text = "Fernando Chullo"
+    table.rows[1].cells[0].text = "PROFILE"
+    table.rows[2].cells[0].text = "Original profile"
+    docx.save(source_path)
+
+    now = datetime.now(UTC)
+    document_id = uuid4()
+    repository = DocumentsRepository()
+    repository.get_editable_document_context = lambda _document_id: {
+        "document_id": document_id,
+        "tesis_id": uuid4(),
+        "path": source_path,
+        "filename": "cv.docx",
+        "temporary": False,
+    }
+    repository.list_sections = lambda _document_id: [
+        StructuredSectionRead(
+            id=uuid4(),
+            document_id=document_id,
+            heading="PROFESSIONAL PROFILE",
+            level=1,
+            content="Edited profile",
+            order_index=1,
+            source_paragraphs=[1, 2],
+            manual_override=True,
+            version=2,
+            created_at=now,
+            updated_at=now,
+        )
+    ]
+
+    context = repository.build_editable_document(document_id)
+    exported = Document(context["path"])
+    exported_text = [paragraph.text for paragraph in repository._document_paragraphs(exported)]
+    original_text = [paragraph.text for paragraph in repository._document_paragraphs(Document(source_path))]
+
+    assert context["temporary"] is True
+    assert exported_text[:3] == [
+        "Fernando Chullo",
+        "PROFESSIONAL PROFILE",
+        "Edited profile",
+    ]
+    assert original_text[:3] == ["Fernando Chullo", "PROFILE", "Original profile"]
+    context["path"].unlink()
