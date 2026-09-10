@@ -30,6 +30,20 @@ DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.docu
 DOCM_MIME = "application/vnd.ms-word.document.macroEnabled.12"
 NO_EDITABLE_PROGRESS_MESSAGE = "No hay avance editable Word disponible para este documento"
 
+GREEK_TRANSLITERATION = str.maketrans(
+    {
+        "α": "a", "β": "b", "γ": "g", "δ": "d", "ε": "e", "ζ": "z",
+        "η": "e", "θ": "th", "ι": "i", "κ": "k", "λ": "l", "μ": "m",
+        "ν": "n", "ξ": "x", "ο": "o", "π": "p", "ρ": "r", "σ": "s",
+        "ς": "s", "τ": "t", "υ": "y", "φ": "ph", "χ": "ch", "ψ": "ps",
+        "ω": "o", "Α": "A", "Β": "B", "Γ": "G", "Δ": "D", "Ε": "E",
+        "Ζ": "Z", "Η": "E", "Θ": "Th", "Ι": "I", "Κ": "K", "Λ": "L",
+        "Μ": "M", "Ν": "N", "Ξ": "X", "Ο": "O", "Π": "P", "Ρ": "R",
+        "Σ": "S", "Τ": "T", "Υ": "Y", "Φ": "Ph", "Χ": "Ch", "Ψ": "Ps",
+        "Ω": "O",
+    }
+)
+
 
 class DocumentsRepository:
     def __init__(self) -> None:
@@ -485,6 +499,11 @@ class DocumentsRepository:
         }
 
     def _upsert_structured_payload(self, document_id: UUID, payload: dict) -> dict:
+        # The legacy AppThesis database was created with WIN1252 server
+        # encoding. Keep the original DOCX untouched, but transliterate Greek
+        # symbols and replace any other unsupported glyph in the searchable
+        # structured snapshot so one character cannot abort all processing.
+        payload = self._database_safe_value(payload)
         sections_payload = list(payload.get("sections") or [])
         references_payload = list(payload.get("references") or [])
         title = payload.get("title")
@@ -651,6 +670,22 @@ class DocumentsRepository:
                 )
 
         return self.get_document_snapshot(document_id)
+
+    @classmethod
+    def _database_safe_value(cls, value):
+        if isinstance(value, str):
+            return (
+                value.translate(GREEK_TRANSLITERATION)
+                .encode("cp1252", errors="replace")
+                .decode("cp1252")
+            )
+        if isinstance(value, dict):
+            return {key: cls._database_safe_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [cls._database_safe_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._database_safe_value(item) for item in value)
+        return value
 
     def _refresh_document_snapshot(self, document_id: UUID) -> dict:
         row = self._get_document_row(document_id)
